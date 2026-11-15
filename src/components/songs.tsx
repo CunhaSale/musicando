@@ -5,36 +5,53 @@ type N = { n: string; d: number; l: string };
 type Raw = [string, number, string];
 const mk = (lines: Raw[][]): N[][] => lines.map((ln) => ln.map(([n, d, l]) => ({ n, d, l })));
 
-function pluck(ctx: AudioContext, freq: number, when: number, ring: number) {
-  const sr = ctx.sampleRate;
-  const len = Math.max(1, Math.round(sr * ring));
-  const buf = ctx.createBuffer(1, len, sr);
-  const d = buf.getChannelData(0);
-  const period = Math.max(2, Math.round(sr / freq));
-  // ataque: ruído suavizado (corda "beliscada")
-  let prev = 0;
-  for (let i = 0; i < period; i++) {
-    const r = Math.random() * 2 - 1;
-    prev = prev * 0.5 + r * 0.5;
-    d[i] = prev;
-  }
-  // corda: média de duas amostras (filtro) com perda pequena
-  const damp = 0.996;
-  for (let i = period; i < len; i++) {
-    d[i] = damp * 0.5 * (d[i - period] + d[i - period + 1 < i ? i - period + 1 : i - period]);
-  }
-  // fade final para não dar clique
-  const fade = Math.min(len, Math.round(sr * 0.04));
-  for (let i = 0; i < fade; i++) d[len - 1 - i] *= i / fade;
+function createCtx(): AudioContext {
+  // iOS: toca mesmo com a chave de silencioso ligada (Safari 16.4+)
+  try { (navigator as any).audioSession.type = "playback"; } catch {}
+  const AC = window.AudioContext || (window as any).webkitAudioContext;
+  const ctx: AudioContext = new AC();
+  // desbloqueio: toca 1 amostra de silêncio dentro do gesto do usuário
+  const b = ctx.createBuffer(1, 1, ctx.sampleRate);
+  const s = ctx.createBufferSource();
+  s.buffer = b;
+  s.connect(ctx.destination);
+  s.start(0);
+  return ctx;
+}
 
+const pluckCache = new Map<string, AudioBuffer>();
+
+function pluck(ctx: AudioContext, freq: number, when: number) {
+  const sr = ctx.sampleRate;
+  const key = `${sr}:${freq.toFixed(2)}`;
+  let buf = pluckCache.get(key);
+  if (!buf) {
+    const len = Math.round(sr * 1.2);
+    buf = ctx.createBuffer(1, len, sr);
+    const d = buf.getChannelData(0);
+    const period = Math.max(2, Math.round(sr / freq));
+    let prev = 0;
+    for (let i = 0; i < period; i++) {
+      prev = prev * 0.5 + (Math.random() * 2 - 1) * 0.5;
+      d[i] = prev;
+    }
+    for (let i = period; i < len; i++) {
+      d[i] = 0.996 * 0.5 * (d[i - period] + d[i - period + 1]);
+    }
+    const fade = Math.round(sr * 0.04);
+    for (let i = 0; i < fade; i++) d[len - 1 - i] *= i / fade;
+    pluckCache.set(key, buf);
+  }
   const src = ctx.createBufferSource();
   src.buffer = buf;
   const lp = ctx.createBiquadFilter();
   lp.type = "lowpass";
-  lp.frequency.value = 2500; // som de madeira/nylon, menos "metálico"
+  lp.frequency.value = 3500;
   const g = ctx.createGain();
   g.gain.value = 0.9;
-  src.connect(lp).connect(g).connect(ctx.destination);
+  src.connect(lp);
+  lp.connect(g);
+  g.connect(ctx.destination);
   src.start(when);
 }
 
@@ -125,16 +142,17 @@ export function SongPlayer({ song, full = false }: { song: Song; full?: boolean 
   }, [active]);
 
   const play = () => {
-    if (playing) return stopRef.current();
-    const ctx = new AudioContext();
-    const eighth = 60 / bpm / 2;
-    let t = ctx.currentTime + 0.2;
-    const timers: number[] = [];
+     if (playing) return stopRef.current();
+  const ctx = createCtx();
+  if (ctx.state !== "running") await ctx.resume().catch(() => {});
+  const eighth = 60 / bpm / 2;
+  let t = ctx.currentTime + 0.2;
+  const timers: number[] = [];
     notes.forEach((note, i) => {
   const dur = note.d * eighth;
   if (note.n !== "R") {
     const freq = 440 * Math.pow(2, (MIDI[note.n]! - 69) / 12);
-    pluck(ctx, freq, t, Math.max(dur * 1.8, 0.6)); // a corda continua soando um pouco depois
+    pluck(ctx, freq, t); // a corda continua soando um pouco depois
   }
   timers.push(window.setTimeout(() => setActive(i), (t - ctx.currentTime) * 1000));
   t += dur;
